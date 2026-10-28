@@ -60,20 +60,25 @@ def frida_inject():
     return data
 
 
-def main():
+def build(target="quest"):
+    """Build the module for target: 'quest' (Quest Pro/3) or 'galaxy_xr' (Samsung Galaxy XR)."""
     os.makedirs(os.path.join(HERE, "build"), exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
+    backend = os.path.join(HERE, "src", f"{target}.c" if target == "quest" else "galaxy_xr.c")
+    if not os.path.exists(backend):
+        sys.exit(f"unknown target {target!r}: no {backend}")
     daemon = os.path.join(HERE, "build", "lhsyncd")
     subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
                     f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}", os.path.join(HEADSET, "lhsyncd.c"),
-                    os.path.join(HERE, "src", "quest.c"), "-llog", "-s", "-o", daemon],
+                    backend, "-llog", "-s", "-o", daemon],
                    check=True)
     js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
     c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()
     js = js.replace("@CSRC@", c).replace("@DUR@", "0")
     prop = open(os.path.join(HERE, "module", "module.prop.in"), encoding="utf-8").read()
     prop = prop.replace("@VERSION@", VERSION).replace("@CODE@", str(CODE))
-    zpath = os.path.join(OUT, f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
+    slug = "quest" if target == "quest" else "galaxy-xr"
+    zpath = os.path.join(OUT, f"QuestLHSync-{slug}-module-{VERSION.lstrip('v')}.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         def add(name, data, mode=0o644):
             info = zipfile.ZipInfo(name, date_time=(2026, 10, 3, 0, 0, 0))
@@ -90,6 +95,11 @@ def main():
         add("frida-inject", frida_inject(), 0o755)
     print(f"built {zpath} ({os.path.getsize(zpath) / 1e6:.1f} MB)")
     return zpath
+
+
+def main():
+    target = sys.argv[1] if len(sys.argv) > 1 else "quest"
+    return build(target)
 
 
 if __name__ == "__main__":
