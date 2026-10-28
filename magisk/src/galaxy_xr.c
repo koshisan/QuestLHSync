@@ -60,7 +60,39 @@ static int calibration_path(char *path, size_t n) {
   return access(path, R_OK) == 0;
 }
 
-// wrap the QVR XML calibration in a JSON envelope the PC driver can identify
+// extract an XML attribute value: attr="value" → value written to out (up to cap-1 chars)
+static int xml_attr(const char *start, const char *end, const char *attr, char *out, size_t cap) {
+  char needle[64];
+  snprintf(needle, sizeof needle, "%s=\"", attr);
+  const char *p = start;
+  while ((p = strstr(p, needle)) && p < end) {
+    p += strlen(needle);
+    const char *q = strchr(p, '"');
+    if (!q || q > end) return 0;
+    size_t n = (size_t)(q - p);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return 1;
+  }
+  return 0;
+}
+
+// parse space-separated doubles from a string
+static int parse_doubles(const char *s, double *out, int max) {
+  int n = 0;
+  while (n < max) {
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s) break;
+    out[n++] = v;
+    s = end;
+    while (*s == ' ' || *s == '\t') s++;
+  }
+  return n;
+}
+
+// parse QVR XML calibration into GxrCameraCalibration JSON for the PC driver
 int hs_calibration(char **data, size_t *len, char *name, size_t n) {
   char path[512];
   if (!calibration_path(path, sizeof path)) {
@@ -74,35 +106,82 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n) {
     snprintf(name, n, "can't read %s", path);
     return -1;
   }
-  // {"kind": "galaxy_xr", "qvr_calibration": "<xml content>"}
-  // Escape the XML for JSON embedding: replace \ with \\, " with \", newlines with \n
-  size_t esc_cap = xml_len * 2 + 256;
-  char *esc = malloc(esc_cap);
-  size_t eo = 0;
-  for (size_t i = 0; i < xml_len && eo + 8 < esc_cap; i++) {
-    char c = xml[i];
-    if (c == '\\') { esc[eo++] = '\\'; esc[eo++] = '\\'; }
-    else if (c == '"') { esc[eo++] = '\\'; esc[eo++] = '"'; }
-    else if (c == '\n') { esc[eo++] = '\\'; esc[eo++] = 'n'; }
-    else if (c == '\r') { /* skip */ }
-    else if ((unsigned char)c < 0x20) { esc[eo++] = ' '; }
-    else esc[eo++] = c;
+
+  // build GxrCameraCalibration JSON from the QVR XML
+  size_t jcap = 16384;
+  char *json = malloc(jcap);
+  size_t jo = 0;
+  #define JP(...) do { jo += snprintf(json + jo, jcap - jo, __VA_ARGS__); } while(0)
+  JP("{\"kind\": \"galaxy_xr\", \"GxrCameraCalibration\": [");
+
+  const char *p = xml, *e = xml + xml_len;
+  int ncam = 0;
+  char attr[512];
+
+  while ((p = strstr(p, "<Camera ")) && p < e) {
+    const char *ce = strstr(p, "</Camera>");
+    if (!ce || ce > e) break;
+
+    // camera name: only tracking* and ctrl-tracking*
+    if (!xml_attr(p, ce, "name", attr, sizeof attr)) { p = ce; continue; }
+    int is_tracking = !strncmp(attr, "tracking", 8);
+    int is_ctrl = !strncmp(attr, "ctrl-tracking", 13);
+    if (!is_tracking && !is_ctrl) { p = ce; continue; }
+
+    // skip rolling shutter cameras
+    if (strstr(p, "isRollingShutter=\"true\"") && strstr(p, "isRollingShutter=\"true\"") < ce) { p = ce; continue; }
+
+    // parse Calibration
+    const char *cal = strstr(p, "<Calibration ");
+    if (!cal || cal > ce) { p = ce; continue; }
+    const char *cal_end = strchr(cal, '/');
+    if (!cal_end || cal_end > ce) cal_end = ce;
+
+    double sz[2] = {640, 640}, pp[2] = {320, 320}, fl[2] = {240, 240}, rd[6] = {0};
+    if (xml_attr(cal, cal_end, "size", attr, sizeof attr)) parse_doubles(attr, sz, 2);
+    if (xml_attr(cal, cal_end, "principal_point", attr, sizeof attr)) parse_doubles(attr, pp, 2);
+    if (xml_attr(cal, cal_end, "focal_length", attr, sizeof attr)) parse_doubles(attr, fl, 2);
+    if (xml_attr(cal, cal_end, "radial_distortion", attr, sizeof attr)) parse_doubles(attr, rd, 6);
+
+    // parse Rig (extrinsics relative to camera 0 = device origin)
+    double tr[3] = {0}, rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    const char *rig = strstr(p, "<Rig ");
+    if (rig && rig < ce) {
+      const char *rig_end = strchr(rig, '/');
+      if (!rig_end || rig_end > ce) rig_end = ce;
+      if (xml_attr(rig, rig_end, "translation", attr, sizeof attr)) parse_doubles(attr, tr, 3);
+      if (xml_attr(rig, rig_end, "rowMajorRotationMat", attr, sizeof attr)) parse_doubles(attr, rot, 9);
+    }
+
+    if (ncam) JP(",");
+    JP("\n  {\"Id\": %d, \"ImageSize\": [%.0f, %.0f],", ncam, sz[0], sz[1]);
+    // DeviceFromCamera: 4x4 row-major [R | t; 0 0 0 1]
+    JP(" \"DeviceFromCamera\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, 0, 0, 0, 1],",
+       rot[0], rot[1], rot[2], tr[0], rot[3], rot[4], rot[5], tr[1], rot[6], rot[7], rot[8], tr[2]);
+    JP(" \"Projection\": {\"Model\": \"PinholeXY\", \"Coefficients\": [%.10g, %.10g, %.10g, %.10g]},",
+       fl[0], fl[1], pp[0], pp[1]);
+    // Distortion: [k0..k5, p0, p1] — QVR FISHEYE_4_PARAMETERS gives 4 radial, rest zero
+    JP(" \"Distortion\": {\"Coefficients\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g, 0, 0]},",
+       rd[0], rd[1], rd[2], rd[3], rd[4], rd[5]);
+    JP(" \"SensorType\": \"S5K931\"}");
+    ncam++;
+    p = ce;
   }
-  esc[eo] = 0;
 
-  static const char hdr[] = "{\"kind\": \"galaxy_xr\", \"qvr_calibration\": \"";
-  static const char trl[] = "\"}\n";
-  *len = strlen(hdr) + eo + strlen(trl);
-  *data = malloc(*len + 1);
-  char *o = *data;
-  memcpy(o, hdr, strlen(hdr)); o += strlen(hdr);
-  memcpy(o, esc, eo); o += eo;
-  memcpy(o, trl, strlen(trl) + 1);
+  JP("\n]}\n");
+  #undef JP
 
-  free(esc);
   free(xml);
+  if (!ncam) {
+    free(json);
+    snprintf(name, n, "no tracking cameras in QVR calibration %s", path);
+    return -1;
+  }
+
+  *data = json;
+  *len = jo;
   const char *base = strrchr(path, '/');
-  snprintf(name, n, "qvr/%s", base ? base + 1 : path);
+  snprintf(name, n, "galaxy_xr/%s (%d cameras)", base ? base + 1 : path, ncam);
   return 0;
 }
 
