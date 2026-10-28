@@ -4,7 +4,9 @@ QuestLHSync support for the Samsung Galaxy XR headset, enabling SteamVR Lighthou
 
 ## Status
 
-**Experimental** — IR sensitivity of the S5K931 tracking cameras to 850nm Lighthouse laser sweeps has not yet been confirmed. The buffer discovery and readout pipeline is functional.
+**Experimental** — the buffer discovery and readout pipeline is functional. Empirical confirmation with actual base stations is pending.
+
+The S5K931 sensor is **NIR-optimized** with 60% quantum efficiency at 850nm ([Samsung Semiconductor](https://semiconductor.samsung.com/image-sensor/global-shutter-image-sensor/isocell-vizion-931/)), which is the exact wavelength used by SteamVR Lighthouse base stations. This makes it well-suited for detecting laser sweeps — likely better than the Quest Pro's OV7251, whose 850nm QE is lower (exact figure not publicly documented). The remaining unknown is whether Samsung places an IR-cut filter in front of the tracking camera optics on the Galaxy XR.
 
 ## Requirements
 
@@ -21,7 +23,7 @@ QuestLHSync support for the Samsung Galaxy XR headset, enabling SteamVR Lighthou
 | | Quest Pro / Quest 3 | Galaxy XR |
 |---|---|---|
 | **Frida target** | `vendor.oculus.hardware.sensors@1.0-service` | `android.hardware.perceptionhost` |
-| **Tracking cameras** | OV7251, 640x480, Y8, global shutter | Samsung S5K931, 640x640, Y8, global shutter |
+| **Tracking cameras** | OV7251, 640x480, Y8, global shutter | Samsung S5K931 (ISOCELL Vizion 931), 640x640, Y8, global shutter, 60% QE @ 850nm |
 | **Calibration** | `/persist/calibration/camera_calibration.json` (JSON) | `/vendor/etc/qvr/device_calibration_default.xml` (QVR XML) |
 | **Frame buffer size** | 307,200 bytes (640x480) | 409,600 bytes (640x640 single) / 819,200 bytes (1280x640 stereo) |
 | **Tracking cameras** | 4 (2 front OG01A + 2 side OV7251) | 4 (2 tracking + 2 ctrl-tracking, all S5K931) |
@@ -78,7 +80,7 @@ The XML contains per-camera intrinsics (FISHEYE_4_PARAMETERS distortion model), 
 
 ## Open questions
 
-1. **IR sensitivity**: Can the S5K931 sensor detect 850nm infrared (SteamVR Lighthouse wavelength)? The sensor is designed for visible-light SLAM, but many CMOS sensors have residual NIR sensitivity. Only testable with actual base stations.
+1. **IR-cut filter**: The S5K931 sensor itself has excellent 850nm sensitivity (60% QE), but Samsung may place an IR-cut filter on the Galaxy XR's tracking camera optics. The ctrl-tracking cameras have an IR torch (`torch-sequence` flash mode in QVR config), suggesting at least those operate in NIR — a good sign. Only testable empirically with base stations.
 2. **Exposure cycle**: QuestLHSync relies on short-exposure frames for Lighthouse detection (ambient light filtered out). The Galaxy XR's exposure cycling pattern needs characterization.
 3. **Camera identification**: The buffer discovery groups dmabufs by size, but we need to confirm which groups correspond to tracking vs. ctrl-tracking vs. face cameras. Mean brightness during active use distinguishes them (tracking ~44, ctrl-tracking with IR torch ~85-94).
 4. **PC-side calibration parsing**: The SteamVR driver needs a parser for the `galaxy_xr` calibration kind (QVR XML with FISHEYE_4_PARAMETERS).
