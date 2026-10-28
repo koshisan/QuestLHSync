@@ -60,7 +60,8 @@ function discover() {
     var ids = cams.map(function (c) { return c.id; }).join("+");
     if (!regs.length || regs.length % cams.length) {
       console.log("W cameras " + ids + " (" + cams[0].w + "x" + cams[0].h + "): " + regs.length + " buffers, not " +
-                  cams.length + " equal rings");
+                  cams.length + " equal rings — trying active-buffer discovery");
+      n += discoverActive(regs, cams);
       return;
     }
     var per = regs.length / cams.length, byName = regs.every(function (r) { return r.id >= 0; });
@@ -83,6 +84,66 @@ function discover() {
     }).join(" ") || "none"));
   } else console.log("I cameras " + got.join(" "));
   prime();
+  return n;
+}
+// Galaxy XR fallback: when buffer count doesn't divide evenly (multiple camera types share the same resolution),
+// find active buffers via hash polling, group by brightness, and register the room-facing groups.
+function discoverActive(regs, cams) {
+  var scanCams = cams.filter(function (c) { return c.scan; });
+  if (!scanCams.length) return 0;
+  var w = scanCams[0].w, h = scanCams[0].h, sz = w * h;
+  // hash all buffers once
+  var hashes = regs.map(function (r) {
+    var p = ptr(r.a), step = Math.floor(sz / 61), hh = 2166136261;
+    for (var o = Math.floor(step / 2); o < sz; o += step) { hh ^= p.add(o).readU8(); hh = Math.imul(hh, 16777619) >>> 0; }
+    return hh;
+  });
+  // poll for 3 seconds to find active buffers
+  var active = {}, t0 = Date.now();
+  while (Date.now() - t0 < 3000) {
+    for (var i = 0; i < regs.length; i++) {
+      var p = ptr(regs[i].a), step = Math.floor(sz / 61), hh = 2166136261;
+      for (var o = Math.floor(step / 2); o < sz; o += step) { hh ^= p.add(o).readU8(); hh = Math.imul(hh, 16777619) >>> 0; }
+      if (hh !== hashes[i]) { hashes[i] = hh; active[i] = (active[i] || 0) + 1; }
+    }
+    usleep(2000);
+  }
+  var activeKeys = Object.keys(active);
+  console.log("I active-buffer scan: " + activeKeys.length + " of " + regs.length + " active");
+  if (!activeKeys.length) return 0;
+  // measure mean brightness of each active buffer and group into brightness bands
+  var mstep = Math.floor(sz / 4096);
+  var groups = {};
+  for (var k = 0; k < activeKeys.length; k++) {
+    var idx = parseInt(activeKeys[k]);
+    var p = ptr(regs[idx].a), s = 0, c = 0;
+    for (var oo = Math.floor(mstep / 2); oo < sz; oo += mstep) { s += p.add(oo).readU8(); c++; }
+    var mean10 = Math.round(s * 10 / c);
+    var bucket = Math.round(mean10 / 200) * 200;
+    if (!groups[bucket]) groups[bucket] = [];
+    groups[bucket].push({ idx: idx, reg: regs[idx], mean10: mean10 });
+  }
+  // pick groups whose mean is in the range of scanning cameras (room-facing: mean*10 600-950 on Galaxy XR)
+  // A camera with scan=1 at mean*10 ~750-900 is a room-facing tracking camera
+  var n = 0, camIdx = 0;
+  var buckets = Object.keys(groups).sort(function (a, b) { return a - b; });
+  for (var b = 0; b < buckets.length; b++) {
+    var bk = parseInt(buckets[b]);
+    // room-facing cameras on Galaxy XR: mean*10 in 600-1000 range (actual mean 60-100)
+    if (bk < 600 || bk > 1000) continue;
+    var grp = groups[bk];
+    var cid = camIdx < scanCams.length ? scanCams[camIdx].id : camIdx;
+    // register a subset of this group's buffers as ring slots for one camera
+    // pick evenly spaced buffers (max 20 per camera to avoid slow scans)
+    var step = Math.max(1, Math.floor(grp.length / 20));
+    var added = 0;
+    for (var j = 0; j < grp.length && added < 20; j += step) {
+      add_slot(ptr(grp[j].reg.a), w, h, cid);
+      added++; n++;
+    }
+    console.log("I brightness group ~" + bk + ": " + grp.length + " buffers, registered " + added + " as cam " + cid);
+    camIdx++;
+  }
   return n;
 }
 function mono_us() { clock_gettime(1, tsBuf); return tsBuf.readS64().toNumber() * 1e6 + Math.floor(tsBuf.add(8).readS64().toNumber() / 1000); }
