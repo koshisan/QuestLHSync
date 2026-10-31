@@ -17,11 +17,12 @@ head both a lamp and a station come down to a handful of rays, and a wrong align
 two lamps reaches `ACQ` sooner than the right one, whose rays come in slowly. After *Force recalibrate*
 (`acq_forced_`) half of `ACQ` already wins (`Solver::Step`, `enough`).
 
-## Measured: occupancy tells them apart
+## Measured: occupancy separates steady lights, not the lit room's lamps
 
 Occupancy of a ray: of the camera's short frames in the ±5 s around it, the share that had a saturated spot within 1°
 of the same **world** direction (a lamp stays put in the world as the head turns). On a 5.8 min mount recording
-(30 Oct 2026, lights on, the truth from the tracker), with sightings counted as a station's within 1° of the truth:
+(30 Oct 2026, room lighting not noted, the truth from the tracker), with sightings counted as a station's within 1°
+of the truth:
 
 | | n | occupancy 5 / 25 / 50 / 75 / 95 % |
 |---|---|---|
@@ -31,13 +32,27 @@ of the same **world** direction (a lamp stays put in the world as the head turns
 | threshold | station sightings kept | other spots dropped |
 |---|---|---|
 | 5 % | 97 % | 78 % |
-| **10 %** | **100 %** | **71 %** |
+| 10 % | 100 % | 71 % |
 | 20 % | 100 % | 63 % |
 | 50 % | 100 % | 47 % |
 
 Expected for a station: two sweep planes per rotor turn (~20 ms) cross a direction for a few µs each, so a 144 µs
 exposure catches one in ~1.4 % of frames, in bursts as the rotor's phase drifts against the 15/s short frames per
-camera. Mains-flickering lamps would come out near 50 %, steady ones near 100 %.
+camera.
+
+**But in the lit room it isn't enough.** In the 31 Oct recording (lights on), the 416 spots the wrong alignment rests
+on (within 1° of its stations) have a median occupancy of **10 %** (5–95 %: 3–30 %), not the steady lights' 44 %:
+
+| threshold | spots of the lamp alignment dropped |
+|---|---|
+| 5 % | 86 % |
+| 10 % | 54 % |
+| 20 % | 14 % |
+
+So these lamps are seen in only part of the short exposures; a guess, not checked: they flicker with the mains, and a
+144 µs exposure catches their bright phase now and then. At 5 % (97 % of the station sightings kept) ~58 of the 416
+would remain, and whether that keeps the wrong alignment under `ACQ` after `Thin` is untested. A run with the room
+fully lit and the tracker on the mount, with enough head movement for a usable truth, is still missing.
 
 ## Design
 
@@ -46,15 +61,19 @@ camera. Mains-flickering lamps would come out near 50 %, steady ones near 100 %.
    time, as `Solver::Add` gets them). For a new ray: the share of that camera's short frames within ±5 s with a
    bright ray within 1° of its direction. The centre of the window lies 5 s back, so a ray is judged ~5 s late, or on
    the window so far (one-sided) while acquiring.
-2. **Lamps out of acquisition only:** rays over 10 % occupancy go to `Solver` flagged (like `B` for dim ones) and
+2. **Lamps out of acquisition only:** rays over a threshold (5 % from the numbers above; to be checked against a
+   fully lit run) go to `Solver` flagged (like `B` for dim ones) and
    `Acquire` / `Hypotheses` leave them out. Tracking a fit (`Fit`, `Support` of the current alignment) can keep them;
    a lamp far from a station doesn't count there anyway.
 3. **Count them:** a `lamps` number next to `bright spots, used` in the acquiring log line and the overlay's
    *Bright spots* row, so a lit room shows.
-4. **Optional, second stage:** check a candidate's per-station sightings against the station's rotor period with the
-   existing `SeenScores` (station identity): a lamp assigned to a station shows no periodicity at τ. Needs
-   `kMinN` 60 in-view frames and `kMinSeen` 20 sightings per station, i.e. tens of seconds seated: as a veto on a
-   candidate, not a gate on acquiring.
+4. **Second stage, likely needed for flickering lamps:** check a candidate's per-station sightings against the
+   station's rotor period with the existing `SeenScores` (station identity): a lamp assigned to a station shouldn't
+   show periodicity at τ. Needs `kMinN` 60 in-view frames and `kMinSeen` 20 sightings per station, i.e. tens of
+   seconds seated: as a veto on a candidate, not a gate on acquiring. A caution, unchecked: on a 50 Hz grid a lamp
+   flickers at 100 Hz, and a channel 1 station turns at 50.05 Hz with two sweeps a turn, so both repeat every ~10 ms
+   and part only by 0.1 %: telling them apart takes ~20 s of sightings, and the fake periods `SeenScores` compares
+   against must not sit on the mains' harmonics.
 5. **`acq_forced_`:** halving `ACQ` after *Force recalibrate* lets a lamp fit in at 6. Keep it for the Quest; for a
    Galaxy XR (exact times, few sightings) require the full `ACQ`, or apply it only once the occupancy filter is in.
 
@@ -65,5 +84,7 @@ measured the table above (occupancy against the truth from a mounted tracker) ar
 
 - 31 Oct, lights on, *Force recalibrate*: must **not** acquire yaw −97.7 (or anything >20° off the truth); acquiring on
   until the stations are seen is fine.
+- Still to record: the room fully lit, the tracker on the mount, *Force recalibrate*, a few minutes seated and then
+  walking about (the walking gives the truth), to set the threshold and check the second stage.
 - 30 Oct, 5.8 min with the mount and walking: must still acquire within ~1 min, ending within 0.5° / 5 cm of the truth.
 - A seated recording with the lights off: acquisition time no worse than now.
