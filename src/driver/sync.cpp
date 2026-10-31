@@ -2784,6 +2784,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   solver_.SetDimDots(optics_.headset() == Optics::kFrame);
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
+  if (!timing_learned_) expo_ = DefaultExpo();  // the headset is known from here
   return true;
 }
 
@@ -2872,9 +2873,15 @@ void Sync::ApplyTiming() {
     timing_learned_ = true;
     log_(Fmt("timing for %s: %.1f ms (learned before)", streamer_.c_str(), it->second * 1000));
   } else {
-    expo_ = cfg_.arrival_clock ? kExpoArrival : kExpoDefault;
+    expo_ = DefaultExpo();
     timing_learned_ = false;
   }
+}
+
+// the timing before one is learned: the headset's, once its calibration says which it is
+double Sync::DefaultExpo() const {
+  if (cfg_.arrival_clock) return kExpoArrival;
+  return have_optics_ && optics_.headset() == Optics::kGalaxyXR ? kExpoGalaxyXR : kExpoDefault;
 }
 
 // the sightings, the fit and what hung on them: gone, the lighthouse devices uncorrected until the next acquisition
@@ -3126,8 +3133,11 @@ void Sync::Use(const Shot &f) {
     if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
-      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
-              D.y, D.z, p.x, p.y, p.z, w, b.peak);
+      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d %d %d %d", t, cam, O.x, O.y, O.z,
+              D.x, D.y, D.z, p.x, p.y, p.z, w, b.peak, x10, y10, npx);
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) fprintf(g_ray_dump, " %.7f", R.m[r][c]);
+      fprintf(g_ray_dump, " %.7f\n", hg);
     }
     if (w > kWmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;

@@ -51,11 +51,11 @@ int main(int argc, char **argv) {
   cfg.learn_timing = learn;
   cfg.learn_grid = learn_grid;
   Sync sync(cfg, logfn);
-  if (expo >= 0) sync.ForceExpo(expo);
   sync.SetStreamer("replay");
   sync.SetChannels(chans);
   std::string err;
   if (!sync.SetCalibration(ss.str(), &err)) { fprintf(stderr, "calibration: %s\n", err.c_str()); return 1; }
+  if (expo >= 0) sync.ForceExpo(expo);  // after the calibration, which sets the headset's own default
   FILE *out = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
   FILE *xf = xfp.empty() ? nullptr : fopen(xfp.c_str(), "w");
   long ticks = 0;

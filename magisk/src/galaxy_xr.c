@@ -1,9 +1,10 @@
-// lhsyncd's Galaxy XR side (src/headset/headset.h): Android properties, Qualcomm QVR camera calibration, and lhsight
-// as a Frida script (frida-inject + lhsight.js) inside perceptionhost: it reads the camera rings and writes nothing.
+// lhsyncd's Galaxy XR side (src/headset/headset.h): Android properties, Google's OpenPX camera calibration, and
+// lhsight-gxr (gxrsight.c), the camera reader: a QVR camera client of its own, as Samsung's controller service is one.
 // The Galaxy XR uses Samsung S5K931 global-shutter tracking cameras (640x640 Y8), managed by Google's Perception stack
 // through android.hardware.perceptionhost instead of Meta's sensors HAL.
 #include <dirent.h>
 #include <fcntl.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,14 +19,13 @@
 
 #include "headset.h"
 
-#define PERCEPTION "android.hardware.perceptionhost"
-#define RUNDIR "/dev/.questlhsync"
 
-// QVR calibration paths (Qualcomm VR / Google Perception)
-#define CAL_RUNTIME "/data/vendor/qvr/device_calibration.xml"
-#define CAL_DEFAULT "/vendor/etc/qvr/device_calibration_default.xml"
+// Google's OpenPX calibration: the device profile, and this unit's refinements of some cameras' extrinsics. (The QVR
+// XML under /data/vendor/qvr is an unconfigured default: its rig is 15 deg off what the cameras see.)
+#define OPX_PROFILE "/vendor/etc/calibration_service/device_profile.textproto"
+#define OPX_RECORDS "/data/vendor/openpx/calibration/records"
 
-const char *const hs_capture_name = "frida";
+const char *const hs_capture_name = "lhsight-gxr";
 static const char *moddir = "/data/adb/modules/questlhsync";
 
 void hs_log(const char *line) { __android_log_print(ANDROID_LOG_INFO, "QuestLHSync", "%s", line); }
@@ -52,257 +52,173 @@ static char *read_file(const char *path, size_t *len) {
   return buf;
 }
 
-// the calibration file: runtime-refined if readable, else factory default
-static int calibration_path(char *path, size_t n) {
-  snprintf(path, n, "%s", CAL_RUNTIME);
-  if (access(path, R_OK) == 0) return 1;
-  snprintf(path, n, "%s", CAL_DEFAULT);
-  return access(path, R_OK) == 0;
-}
+// ---------------------------------------------------------------- calibration (OpenPX textproto)
+// The tracking cameras lhsight reads, by the ids it sends them as. trackingA/B sit low and look 25 deg down,
+// trackingC/D sit high and look level; each pair 23 deg out to either side. This unit runs the _curved profiles (its
+// own records refine those).
+static const char *const kCam[] = {"trackingA_curved", "trackingB_curved", "trackingC_curved", "trackingD_curved"};
+#define NCAM ((int)(sizeof kCam / sizeof kCam[0]))
+// The HMD pose's origin in IMU_0 (OpenGL axes: x right, y up, z back). First guessed from the eye cameras' places
+// (between the eyes, 2.5 cm of eye relief behind the lenses: 0.0625, -0.035, 0.050); measured with a tracker on a
+// headset mount (5.8 min, 680 station sightings): 5.6 cm further back, 1.6 cm lower, 1 cm to the right
+// (+-2 cm), which took the solve from 13 cm off the tracker's truth to 4
+static const double kEye[3] = {0.0725, -0.051, 0.106};
 
-// extract an XML attribute value: attr="value" → value written to out (up to cap-1 chars)
-static int xml_attr(const char *start, const char *end, const char *attr, char *out, size_t cap) {
-  char needle[64];
-  snprintf(needle, sizeof needle, "%s=\"", attr);
-  const char *p = start;
-  while ((p = strstr(p, needle)) && p < end) {
-    p += strlen(needle);
-    const char *q = strchr(p, '"');
-    if (!q || q > end) return 0;
-    size_t n = (size_t)(q - p);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = 0;
-    return 1;
+// the body of a "key {" block at or after s (before e), braces matched
+static int opx_sub(const char *s, const char *e, const char *key, const char **bs, const char **be) {
+  size_t kl = strlen(key);
+  for (const char *p = s; p && p < e; p++) {
+    p = strstr(p, key);
+    if (!p || p + kl > e) return 0;
+    const char *q = p + kl;
+    while (q < e && (*q == ' ' || *q == '\t')) q++;
+    if (q >= e || *q != '{') continue;
+    int depth = 0;
+    for (const char *r = q; r < e; r++) {
+      if (*r == '{') depth++;
+      else if (*r == '}' && --depth == 0) { *bs = q + 1; *be = r; return 1; }
+    }
+    return 0;
   }
   return 0;
 }
 
-// parse space-separated doubles from a string
-static int parse_doubles(const char *s, double *out, int max) {
-  int n = 0;
-  while (n < max) {
-    char *end;
-    double v = strtod(s, &end);
-    if (end == s) break;
-    out[n++] = v;
-    s = end;
-    while (*s == ' ' || *s == '\t') s++;
+// a top-level "name {" block naming camera id
+static int opx_block(const char *t, const char *e, const char *name, const char *id, const char **bs, const char **be) {
+  char want[96];
+  snprintf(want, sizeof want, "camera_id: \"%s\"", id);
+  size_t nl = strlen(name);
+  for (const char *p = t; p < e; p++) {
+    if (p != t && p[-1] != '\n') continue;
+    if (strncmp(p, name, nl) || p[nl] != ' ') continue;
+    const char *s0, *e0;
+    if (!opx_sub(p, e, name, &s0, &e0)) return 0;
+    const char *c = strstr(s0, want);
+    if (c && c < e0) { *bs = s0; *be = e0; return 1; }
+    p = e0;
   }
-  return n;
+  return 0;
 }
 
-// parse QVR XML calibration into GxrCameraCalibration JSON for the PC driver
+// "field: value" directly in [s, e) (protobuf leaves zeros out: missing reads as 0)
+static double opx_num(const char *s, const char *e, const char *field) {
+  char want[64];
+  snprintf(want, sizeof want, "%s:", field);
+  size_t wl = strlen(want);
+  for (const char *p = s; p && p < e; p++) {
+    p = strstr(p, want);
+    if (!p || p >= e) break;
+    if (p != s && (p[-1] == '_' || (p[-1] >= 'a' && p[-1] <= 'z'))) continue;  // "x:" inside "max:"
+    return strtod(p + wl, NULL);
+  }
+  return 0;
+}
+
+static int opx_vec(const char *s, const char *e, const char *key, const char *const *f, int n, double *out) {
+  const char *bs, *be;
+  if (!opx_sub(s, e, key, &bs, &be)) return 0;
+  for (int i = 0; i < n; i++) out[i] = opx_num(bs, be, f[i]);
+  return 1;
+}
+
+// a pose block (frame_t_camera, a_t_b): p, and the rotation camera -> IMU_0. OpenPX writes JPL quaternions: as
+// Hamilton ones they turn the other way (the cameras' measured relative rotations say so), hence the transpose.
+static int opx_pose(const char *s, const char *e, const char *key, double t[3], double R[9]) {
+  static const char *const xyz[] = {"x", "y", "z"}, *const wxyz[] = {"w", "x", "y", "z"};
+  const char *bs, *be;
+  double q[4];
+  if (!opx_sub(s, e, key, &bs, &be) || !opx_vec(bs, be, "p", xyz, 3, t) || !opx_vec(bs, be, "q", wxyz, 4, q)) return 0;
+  double n = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  if (!(n > 0.5)) return 0;
+  double w = q[0] / n, x = q[1] / n, y = q[2] / n, z = q[3] / n;
+  double H[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                 2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)};
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++) R[r * 3 + c] = H[c * 3 + r];
+  return 1;
+}
+
 int hs_calibration(char **data, size_t *len, char *name, size_t n) {
-  char path[512];
-  if (!calibration_path(path, sizeof path)) {
-    snprintf(name, n, "no QVR calibration in %s or %s", CAL_RUNTIME, CAL_DEFAULT);
+  // a calibration refined elsewhere (fitted to recorded base station sightings) wins over the profile's
+  char op[512];
+  snprintf(op, sizeof op, "%s/calibration_override.json", moddir);
+  size_t olen;
+  char *ov = read_file(op, &olen);
+  if (ov && olen) {
+    *data = ov;
+    *len = olen;
+    snprintf(name, n, "override %s", op);
+    return 0;
+  }
+  free(ov);
+  size_t plen;
+  char *prof = read_file(OPX_PROFILE, &plen);
+  if (!prof || !plen) {
+    free(prof);
+    snprintf(name, n, "can't read %s", OPX_PROFILE);
     return -1;
   }
-  size_t xml_len;
-  char *xml = read_file(path, &xml_len);
-  if (!xml || !xml_len) {
-    free(xml);
-    snprintf(name, n, "can't read %s", path);
-    return -1;
-  }
-
-  // build GxrCameraCalibration JSON from the QVR XML
-  size_t jcap = 16384;
+  const char *pe = prof + plen;
+  size_t jcap = 8192, jo = 0;
   char *json = malloc(jcap);
-  size_t jo = 0;
-  #define JP(...) do { jo += snprintf(json + jo, jcap - jo, __VA_ARGS__); } while(0)
-  JP("{\"kind\": \"galaxy_xr\", \"GxrCameraCalibration\": [");
-
-  const char *p = xml, *e = xml + xml_len;
-  int ncam = 0;
-  char attr[512];
-
-  while ((p = strstr(p, "<Camera ")) && p < e) {
-    const char *ce = strstr(p, "</Camera>");
-    if (!ce || ce > e) break;
-
-    // camera name: only tracking* and ctrl-tracking*
-    if (!xml_attr(p, ce, "name", attr, sizeof attr)) { p = ce; continue; }
-    int is_tracking = !strncmp(attr, "tracking", 8);
-    int is_ctrl = !strncmp(attr, "ctrl-tracking", 13);
-    if (!is_tracking && !is_ctrl) { p = ce; continue; }
-
-    // skip rolling shutter cameras
-    if (strstr(p, "isRollingShutter=\"true\"") && strstr(p, "isRollingShutter=\"true\"") < ce) { p = ce; continue; }
-
-    // parse Calibration
-    const char *cal = strstr(p, "<Calibration ");
-    if (!cal || cal > ce) { p = ce; continue; }
-    const char *cal_end = strchr(cal, '/');
-    if (!cal_end || cal_end > ce) cal_end = ce;
-
-    double sz[2] = {640, 640}, pp[2] = {320, 320}, fl[2] = {240, 240}, rd[6] = {0};
-    if (xml_attr(cal, cal_end, "size", attr, sizeof attr)) parse_doubles(attr, sz, 2);
-    if (xml_attr(cal, cal_end, "principal_point", attr, sizeof attr)) parse_doubles(attr, pp, 2);
-    if (xml_attr(cal, cal_end, "focal_length", attr, sizeof attr)) parse_doubles(attr, fl, 2);
-    if (xml_attr(cal, cal_end, "radial_distortion", attr, sizeof attr)) parse_doubles(attr, rd, 6);
-
-    // parse Rig (extrinsics relative to camera 0 = device origin)
-    double tr[3] = {0}, rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    const char *rig = strstr(p, "<Rig ");
-    if (rig && rig < ce) {
-      const char *rig_end = strchr(rig, '/');
-      if (!rig_end || rig_end > ce) rig_end = ce;
-      if (xml_attr(rig, rig_end, "translation", attr, sizeof attr)) parse_doubles(attr, tr, 3);
-      if (xml_attr(rig, rig_end, "rowMajorRotationMat", attr, sizeof attr)) parse_doubles(attr, rot, 9);
+  #define JP(...) do { jo += snprintf(json + jo, jcap - jo, __VA_ARGS__); } while (0)
+  // galaxy_xr_sensor: lhsight's frame times are the sensors' own (mid-exposure, CLOCK_MONOTONIC), not when it found them
+  JP("{\"kind\": \"galaxy_xr_sensor\", \"GxrCameraCalibration\": [");
+  int ncam = 0, nrec = 0;
+  char missing[256] = "";
+  for (int i = 0; i < NCAM; i++) {
+    const char *cb, *ce, *xb, *xe;
+    double t[3], R[9];
+    if (!opx_block(prof, pe, "cameras", kCam[i], &cb, &ce) || !opx_block(prof, pe, "camera_extrinsics", kCam[i], &xb, &xe) ||
+        !opx_pose(xb, xe, "frame_t_camera", t, R)) {
+      snprintf(missing + strlen(missing), sizeof missing - strlen(missing), " %s", kCam[i]);
+      continue;
     }
-
+    char rp[256];
+    snprintf(rp, sizeof rp, "%s/FRAME_IMU_0_t_CAMERA_%s_.textproto", OPX_RECORDS, kCam[i]);
+    size_t rlen;
+    char *rec = read_file(rp, &rlen);
+    if (rec && rlen && opx_pose(rec, rec + rlen, "a_t_b", t, R)) nrec++;
+    free(rec);
+    static const char *const xy[] = {"x", "y"};
+    double f[2], c[2];
+    if (!opx_vec(cb, ce, "calibrated_focal_length", xy, 2, f) || !opx_vec(cb, ce, "calibrated_principal_point", xy, 2, c) ||
+        !(f[0] > 0 && f[1] > 0)) {
+      snprintf(missing + strlen(missing), sizeof missing - strlen(missing), " %s(intrinsics)", kCam[i]);
+      continue;
+    }
+    double w = opx_num(cb, ce, "calibrated_width"), h = opx_num(cb, ce, "calibrated_height");
     if (ncam) JP(",");
-    JP("\n  {\"Id\": %d, \"ImageSize\": [%.0f, %.0f],", ncam, sz[0], sz[1]);
-    // DeviceFromCamera: 4x4 row-major [R | t; 0 0 0 1]
+    JP("\n  {\"Id\": %d, \"Name\": \"%s\", \"ImageSize\": [%.0f, %.0f],", i, kCam[i], w > 0 ? w : 640, h > 0 ? h : 640);
+    // DeviceFromCamera: 4x4 row-major [R | t; 0 0 0 1], device = the HMD pose's frame (IMU_0's axes, the eyes' origin)
     JP(" \"DeviceFromCamera\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, 0, 0, 0, 1],",
-       rot[0], rot[1], rot[2], tr[0], rot[3], rot[4], rot[5], tr[1], rot[6], rot[7], rot[8], tr[2]);
-    JP(" \"Projection\": {\"Model\": \"PinholeXY\", \"Coefficients\": [%.10g, %.10g, %.10g, %.10g]},",
-       fl[0], fl[1], pp[0], pp[1]);
-    // Distortion: [k0..k5, p0, p1] — QVR FISHEYE_4_PARAMETERS gives 4 radial, rest zero
-    JP(" \"Distortion\": {\"Coefficients\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g, 0, 0]},",
-       rd[0], rd[1], rd[2], rd[3], rd[4], rd[5]);
+       R[0], R[1], R[2], t[0] - kEye[0], R[3], R[4], R[5], t[1] - kEye[1], R[6], R[7], R[8], t[2] - kEye[2]);
+    JP(" \"Projection\": {\"Model\": \"PinholeXY\", \"Coefficients\": [%.10g, %.10g, %.10g, %.10g]},", f[0], f[1], c[0], c[1]);
+    // distortion_fisheye_spline3 isn't a KB polynomial (read as one it runs away at the rim); the lenses are near
+    // ideal equidistant fisheyes, which is what all-zero coefficients give
+    JP(" \"Distortion\": {\"Coefficients\": [0, 0, 0, 0, 0, 0, 0, 0]},");
     JP(" \"SensorType\": \"S5K931\"}");
     ncam++;
-    p = ce;
   }
-
   JP("\n]}\n");
   #undef JP
-
-  free(xml);
+  free(prof);
   if (!ncam) {
     free(json);
-    snprintf(name, n, "no tracking cameras in QVR calibration %s", path);
+    snprintf(name, n, "no tracking cameras in %s:%s", OPX_PROFILE, missing);
     return -1;
   }
-
   *data = json;
   *len = jo;
-  const char *base = strrchr(path, '/');
-  snprintf(name, n, "galaxy_xr/%s (%d cameras)", base ? base + 1 : path, ncam);
+  snprintf(name, n, "openpx/device_profile.textproto (%d cameras, %d with this unit's records)%s%s", ncam, nrec,
+           missing[0] ? "; missing:" : "", missing);
   return 0;
 }
 
-// ---------------------------------------------------------------- camera list from QVR calibration
-// The QVR XML has <Camera name="trackingA"> etc. with <CaptureDetails native_width="640" native_height="640">.
-// We pick cameras named "tracking*" and "ctrl-tracking*" (the global-shutter SLAM cameras).
-// Output: "id:w:h:scan,..." where scan=1 for side cameras (tracking), scan=1 for ctrl-tracking too since the Galaxy XR
-// has all four tracking cameras facing outward (unlike Quest Pro where the front pair rarely saw base stations).
-static int camera_list(const char *xml, size_t len, char *out, size_t cap) {
-  struct { int id, w, h, scan; } c[16];
-  int n = 0;
-  const char *p = xml, *e = xml + len;
-  out[0] = 0;
-
-  while (n < 16 && (p = strstr(p, "<Camera ")) && p < e) {
-    const char *ce = strstr(p, "</Camera>");
-    if (!ce || ce > e) break;
-
-    // extract name="..."
-    const char *nm = strstr(p, "name=\"");
-    if (!nm || nm > ce) { p = ce; continue; }
-    nm += 6;
-    const char *nme = strchr(nm, '"');
-    if (!nme || nme > ce) { p = ce; continue; }
-    int namelen = (int)(nme - nm);
-
-    // only tracking and ctrl-tracking cameras
-    int is_tracking = (namelen >= 8 && !strncmp(nm, "tracking", 8));
-    int is_ctrl = (namelen >= 13 && !strncmp(nm, "ctrl-tracking", 13));
-    if (!is_tracking && !is_ctrl) { p = ce; continue; }
-
-    // extract native resolution from CaptureDetails
-    int w = 640, h = 640;  // default for S5K931
-    const char *cd = strstr(p, "native_width=\"");
-    if (cd && cd < ce) w = atoi(cd + 14);
-    cd = strstr(p, "native_height=\"");
-    if (cd && cd < ce) h = atoi(cd + 15);
-
-    if (w > 0 && h > 0 && w <= 4096 && h <= 4096) {
-      c[n].id = n;
-      c[n].w = w;
-      c[n].h = h;
-      c[n].scan = 1;  // scan all tracking cameras on Galaxy XR
-      n++;
-    }
-    p = ce;
-  }
-
-  size_t o = 0;
-  for (int i = 0; i < n && o + 32 < cap; i++)
-    o += snprintf(out + o, cap - o, "%s%d:%d:%d:%d", i ? "," : "", c[i].id, c[i].w, c[i].h, c[i].scan);
-  return n;
-}
-
-// ---------------------------------------------------------------- find perceptionhost
-static pid_t hal_pid(char *name, size_t cap) {
-  DIR *d = opendir("/proc");
-  if (!d) return 0;
-  struct dirent *e;
-  pid_t found = 0, other = 0;
-  snprintf(name, cap, "%s", PERCEPTION);
-  while (!found && (e = readdir(d))) {
-    if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-    char p[64], cmd[256];
-    snprintf(p, sizeof p, "/proc/%s/cmdline", e->d_name);
-    int fd = open(p, O_RDONLY);
-    if (fd < 0) continue;
-    ssize_t n = read(fd, cmd, sizeof cmd - 1);
-    close(fd);
-    if (n <= 0) continue;
-    cmd[n] = 0;
-    const char *base = strrchr(cmd, '/') ? strrchr(cmd, '/') + 1 : cmd;
-    if (!strcmp(base, PERCEPTION)) found = atoi(e->d_name);
-    else if (!other && strstr(base, "perceptionhost")) {
-      other = atoi(e->d_name);
-      snprintf(name, cap, "%s", base);
-    }
-  }
-  closedir(d);
-  if (found) snprintf(name, cap, "%s", PERCEPTION);
-  return found ? found : other;
-}
-
-// lhsight.js with this headset's cameras filled in
-static void prepare_script(char *out, size_t cap, char *note, size_t ncap) {
-  char src[512], path[512], cams[512] = "";
-  size_t len, cal_len;
-  out[0] = 0;
-  snprintf(src, sizeof src, "%s/lhsight.js", moddir);
-  char *js = read_file(src, &len);
-  if (!js) { snprintf(note, ncap, "can't read %s", src); return; }
-
-  char *cal = NULL;
-  if (calibration_path(path, sizeof path)) cal = read_file(path, &cal_len);
-  int n = cal ? camera_list(cal, cal_len, cams, sizeof cams) : 0;
-  free(cal);
-  if (n) snprintf(note, ncap, "tracking cameras (id:width:height:scan) %s", cams);
-  else snprintf(note, ncap, "no tracking cameras in QVR calibration: trying Galaxy XR defaults (4x 640x640)");
-
-  char *at = strstr(js, "@CAMS@");
-  snprintf(out, cap, "%s/lhsight.js", RUNDIR);
-  FILE *f = fopen(out, "wb");
-  if (!f) { snprintf(note, ncap, "can't write %s", out); out[0] = 0; free(js); return; }
-  if (at && n) {
-    fwrite(js, 1, at - js, f);
-    fputs(cams, f);
-    fputs(at + 6, f);
-  } else if (at && !n) {
-    // Galaxy XR default: 4 tracking cameras, 640x640, all scanned
-    fwrite(js, 1, at - js, f);
-    fputs("0:640:640:1,1:640:640:1,2:640:640:1,3:640:640:1", f);
-    fputs(at + 6, f);
-  } else {
-    fwrite(js, 1, len, f);
-  }
-  fclose(f);
-  chmod(out, 0644);
-  free(js);
-}
-
-// stop stray frida-inject processes running lhsight.js (same as quest.c)
+// ---------------------------------------------------------------- lhsight-gxr
+// a stray reader (this daemon SIGKILLed, an old adb session) would keep its camera clients and the frame pattern:
+// lhsight-gxr, or the Frida script inside perceptionhost that earlier modules ran
 static int is_lhsight(const char *pid) {
   char p[64], cmd[1024];
   snprintf(p, sizeof p, "/proc/%s/cmdline", pid);
@@ -313,6 +229,7 @@ static int is_lhsight(const char *pid) {
   if (len <= 0) return 0;
   cmd[len] = 0;
   const char *base = strrchr(cmd, '/') ? strrchr(cmd, '/') + 1 : cmd;
+  if (!strcmp(base, "lhsight-gxr")) return 1;
   if (strcmp(base, "frida-inject")) return 0;
   for (ssize_t i = strlen(cmd) + 1; i < len; i += strlen(cmd + i) + 1) {
     size_t l = strlen(cmd + i);
@@ -332,7 +249,7 @@ static void kill_strays(void) {
   closedir(d);
   for (int i = 0; i < n; i++) {
     char m[96];
-    snprintf(m, sizeof m, "stopping a stray lhsight (frida-inject pid %s)", found[i]);
+    snprintf(m, sizeof m, "stopping a stray lhsight (pid %s)", found[i]);
     hs_log(m);
     kill(atoi(found[i]), SIGTERM);
   }
@@ -354,17 +271,33 @@ void hs_init(int argc, char **argv) {
   hs_log(m);
 }
 
+// The linker lets an executable under /data (the module) load no vendor library: /linkerconfig/ld.config.txt files
+// /data under "system", whose namespace leaves /vendor/lib64 out, and libqvrcamera_client.qti.so is one. /data/local/tmp
+// is "unrestricted": lhsight-gxr runs from a copy there
+#define RUN_EXE "/data/local/tmp/questlhsync/lhsight-gxr"
+static int copy_file(const char *src, const char *dst) {
+  size_t len;
+  char *data = read_file(src, &len);
+  if (!data) return -1;
+  char tmp[512];
+  snprintf(tmp, sizeof tmp, "%s.new", dst);
+  FILE *f = fopen(tmp, "wb");
+  int ok = f && fwrite(data, 1, len, f) == len;
+  if (f) fclose(f);
+  free(data);
+  if (!ok || chmod(tmp, 0755) || rename(tmp, dst)) { unlink(tmp); return -1; }
+  return 0;
+}
+
+// lhsight-gxr with the ids hs_calibration gives trackingA..D
 pid_t hs_capture_start(int out_fd, char *msg, size_t n) {
-  char hal_name[256];
-  pid_t hal = hal_pid(hal_name, sizeof hal_name);
-  if (!hal) { snprintf(msg, n, "perceptionhost not running"); return 0; }
-  char frida[512], script[512], pidstr[16], note[600];
-  mkdir(RUNDIR, 0755);
-  mkdir(RUNDIR "/tmp", 0755);
-  prepare_script(script, sizeof script, note, sizeof note);
-  if (!script[0]) { snprintf(msg, n, "%s", note); return 0; }
-  snprintf(frida, sizeof frida, "%s/frida-inject", moddir);
-  snprintf(pidstr, sizeof pidstr, "%d", hal);
+  char src[512], id[NCAM][8];
+  const char *exe = RUN_EXE;
+  snprintf(src, sizeof src, "%s/lhsight-gxr", moddir);
+  if (access(src, R_OK)) { snprintf(msg, n, "no %s", src); return -1; }
+  mkdir("/data/local/tmp/questlhsync", 0755);
+  if (copy_file(src, exe)) { snprintf(msg, n, "can't copy %s to %s", src, exe); return -1; }
+  for (int i = 0; i < NCAM; i++) snprintf(id[i], sizeof id[i], "%d", i);
   pid_t pid = fork();
   if (pid == 0) {
     setsid();
@@ -373,12 +306,12 @@ pid_t hs_capture_start(int out_fd, char *msg, size_t n) {
     int nul = open("/dev/null", O_RDONLY);
     dup2(nul, 0);
     for (int fd = 3; fd < 1024; fd++) close(fd);
-    setenv("TMPDIR", RUNDIR "/tmp", 1);
-    chdir(RUNDIR);
-    execl(frida, "frida-inject", "-p", pidstr, "-s", script, (char *)NULL);
+    execl(exe, "lhsight-gxr", id[0], id[1], id[2], id[3], (char *)NULL);
     _exit(127);
   }
   if (pid < 0) return -1;
-  snprintf(msg, n, "lhsight started in %s (pid %d); %s", hal_name, hal, note);
+  snprintf(msg, n, "lhsight-gxr started (pid %d): its own QVR camera clients, cameras %s %s %s %s as 0-3", pid, kCam[0],
+           kCam[1], kCam[2], kCam[3]);
   return pid;
 }
+

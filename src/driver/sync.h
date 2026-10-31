@@ -37,6 +37,10 @@ constexpr double kLagFallback = 0.005;  // s, typical poll lag while the frame g
 constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-envelope clock (logs without round trips)
 constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-trip clock, before it's learned
                                         // (CreoleCast learns 18.5, a replayed streamer 20.8)
+// A Galaxy XR's sightings come too few to learn it (never in a week of sessions); against a tracker on a headset mount
+// (5.8 min, Virtual Desktop) the sightings of a turning head sat tightest at 35 ms (24-50 alike, 18 clearly worse), and
+// the driver's own unsure estimate once said 37 turning right, 52 left
+constexpr double kExpoGalaxyXR = 0.035;
 constexpr double kWmax = 60.0;          // deg/s: sightings while the head turns faster are skipped
 constexpr double kNearDeg = 5.0;        // deg: a fast-head sighting this close to a base station counts for timing
 constexpr int kTimingFirstN = 200;      // such sightings before the first (wide) timing estimate
@@ -597,6 +601,7 @@ class Sync {
   std::atomic<bool> hs_new_{false};
   void ApplyHeadset();
   void ApplyTiming();  // expo_ for the current streamer from timings_, the default if it has none (st_m_ held)
+  double DefaultExpo() const;
   void ClearAlignment();
   void Retime(double old_e, double new_e);
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);

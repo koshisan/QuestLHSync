@@ -1,8 +1,10 @@
-"""Builds the QuestLHSync Magisk module: out/QuestLHSync-quest-module-<version>.zip
+"""Builds the QuestLHSync Magisk module: out/QuestLHSync-quest-module-<version>.zip (or -galaxy-xr-, argument galaxy_xr)
 
   lhsyncd       ../src/headset/lhsyncd.c (shared with the Steam Frame) + src/quest.c, NDK clang for arm64 (Android 10+)
-  lhsight.js    src/lhsight.js with src/lhsight.c inlined (Frida CModule), no time limit
+                (src/galaxy_xr.c for the Galaxy XR)
+  lhsight.js    src/lhsight.js with src/lhsight.c inlined (Frida CModule), no time limit                  (Quest)
   frida-inject  Frida 17.10.0 android-arm64, downloaded once from Frida's GitHub release into frida/ (checked by hash)
+  lhsight-gxr   src/gxrsight.c + src/lhsight.c, a QVR camera client of its own: no Frida  (Galaxy XR, instead of both)
 
 The NDK comes from ANDROID_NDK_HOME / ANDROID_NDK_ROOT, else the newest one in the Android SDK (ANDROID_HOME or
 %LOCALAPPDATA%/Android/Sdk).
@@ -70,11 +72,19 @@ def build(target="quest"):
     daemon = os.path.join(HERE, "build", "lhsyncd")
     subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
                     f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}", os.path.join(HEADSET, "lhsyncd.c"),
-                    backend, "-llog", "-s", "-o", daemon],
+                    backend, "-llog", "-lm", "-s", "-o", daemon],
                    check=True)
-    js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
-    c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()
-    js = js.replace("@CSRC@", c).replace("@DUR@", "0")
+    gxr = target == "galaxy_xr"
+    if gxr:
+        reader = os.path.join(HERE, "build", "lhsight-gxr")
+        subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
+                        os.path.join(HERE, "src", "gxrsight.c"), os.path.join(HERE, "src", "lhsight_native.c"),
+                        "-ldl", "-s", "-o", reader],
+                       check=True)
+    else:
+        js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
+        c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()
+        js = js.replace("@CSRC@", c).replace("@DUR@", "0")
     prop = open(os.path.join(HERE, "module", "module.prop.in"), encoding="utf-8").read()
     prop = prop.replace("@VERSION@", VERSION).replace("@CODE@", str(CODE))
     slug = "quest" if target == "quest" else "galaxy-xr"
@@ -90,9 +100,12 @@ def build(target="quest"):
                     "service.sh", "customize.sh", "uninstall.sh"):
             add(rel, lf(open(os.path.join(m, rel), encoding="utf-8").read()), 0o755 if rel.endswith((".sh", "binary")) else 0o644)
         add("module.prop", lf(prop))
-        add("lhsight.js", lf(js))
         add("lhsyncd", open(daemon, "rb").read(), 0o755)
-        add("frida-inject", frida_inject(), 0o755)
+        if gxr:
+            add("lhsight-gxr", open(reader, "rb").read(), 0o755)
+        else:
+            add("lhsight.js", lf(js))
+            add("frida-inject", frida_inject(), 0o755)
     print(f"built {zpath} ({os.path.getsize(zpath) / 1e6:.1f} MB)")
     return zpath
 
